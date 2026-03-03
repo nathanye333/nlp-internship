@@ -1,7 +1,7 @@
 import mysql.connector
 import pandas as pd
 conn = mysql.connector.connect(
-host='localhost', user='root', password='root', database='real_estate')
+host='127.0.0.1', user='root', password='root', database='real_estate', port=3308)
 query = """
 SELECT L_ListingID, L_Address, L_City, L_Keyword2 as beds,
 LM_Dec_3 as baths, L_SystemPrice as price, L_Remarks as remarks

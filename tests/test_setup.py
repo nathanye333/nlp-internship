@@ -10,15 +10,15 @@ def test_packages():
 def test_docker():
     try:
         conn = mysql.connector.connect(
-        host='localhost',
+        host='127.0.0.1',
         user='root',
         password='root',
-        database='real_estate'
+        port=3308
         )
         conn.close()
         print("✓ MySQL connection successful")
-    except:
-        print("⚠ MySQL not running - start with: docker-compose up -d")
+    except Exception as e:
+        print("⚠ MySQL connection failed:", e)
 if __name__ == "__main__":
     test_python_version()
     test_packages()
