@@ -86,6 +86,22 @@ class QueryParser:
         where_sql, params = self.to_where_sql(filters)
         return ParsedQuery(filters=filters, where_sql=where_sql, params=params)
 
+    def parse_with_intent(self, query: str, intent_classifier) -> dict:
+        """
+        Parse query and enrich output with buyer intent signals.
+        """
+        parsed = self.parse_to_sql(query)
+        prediction = intent_classifier.predict(query)
+        return {
+            "filters": parsed.filters,
+            "where_sql": parsed.where_sql,
+            "params": parsed.params,
+            "intent": prediction.intent,
+            "intent_confidence": prediction.confidence,
+            "intent_uncertain": prediction.is_uncertain,
+            "intent_probabilities": prediction.probabilities,
+        }
+
     def to_where_sql(self, filters: dict) -> tuple[str, list]:
         """
         Convert filters into a safe parameterized WHERE clause.
