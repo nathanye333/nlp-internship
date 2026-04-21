@@ -61,7 +61,7 @@ from scripts.query_parser import QueryParser  # noqa: E402
 # requested so that the rest of the API (and the test suite) remain usable in
 # stripped-down environments.
 if False:  # pragma: no cover - typing only
-    from scripts.semantic_searcher import SearchResult, SemanticSearcher
+    from scripts.semantic_searcher import BM25Searcher, SearchResult, SemanticSearcher
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +170,7 @@ class _Components:
         self._compliance_checker: Optional[ComplianceChecker] = None
         self._submission_service: Optional[ListingSubmissionService] = None
         self._searcher: Any = None
+        self._bm25_searcher: Any = None
         self._searcher_error: Optional[str] = None
 
     def query_parser(self) -> QueryParser:
@@ -228,10 +229,13 @@ class _Components:
                 )
                 raise HTTPException(status_code=503, detail=self._searcher_error)
             try:
-                from scripts.semantic_searcher import SemanticSearcher
+                from scripts.semantic_searcher import BM25Searcher, SemanticSearcher
                 searcher = SemanticSearcher()
                 searcher.load(index_path, meta_path)
                 self._searcher = searcher
+                bm25 = BM25Searcher()
+                bm25.build_index(searcher.remarks, listing_ids=searcher.listing_ids)
+                self._bm25_searcher = bm25
                 return searcher
             except Exception as exc:  # pragma: no cover - depends on env
                 self._searcher_error = str(exc)
@@ -240,6 +244,15 @@ class _Components:
                     status_code=503,
                     detail=f"Semantic searcher unavailable: {exc}",
                 ) from exc
+
+    def bm25_searcher(self) -> Any:
+        """Return BM25 searcher built from semantic index metadata."""
+        with self._lock:
+            if self._bm25_searcher is not None:
+                return self._bm25_searcher
+            # Ensure semantic searcher is loaded first so corpus metadata exists.
+            self.semantic_searcher()
+            return self._bm25_searcher
 
     def reset(self) -> None:
         """Clear cached component instances. Used mainly by tests."""
@@ -250,6 +263,7 @@ class _Components:
             self._compliance_checker = None
             self._submission_service = None
             self._searcher = None
+            self._bm25_searcher = None
             self._searcher_error = None
 
 
@@ -283,6 +297,15 @@ def get_submission_service() -> ListingSubmissionService:
 
 def get_semantic_searcher() -> Any:
     return components.semantic_searcher()
+
+
+def get_bm25_searcher() -> Any:
+    try:
+        return components.bm25_searcher()
+    except HTTPException:
+        # Keep search endpoint usable with semantic-only retrieval in test/dev
+        # environments where persisted artefacts are unavailable.
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +463,55 @@ def apply_filters(results: list, filters: dict) -> list:
     return filtered
 
 
+def hybrid_retrieve(
+    query: str,
+    *,
+    top_k: int,
+    semantic_searcher: Any,
+    bm25_searcher: Any | None = None,
+    semantic_weight: float = 0.7,
+    bm25_weight: float = 0.3,
+) -> list:
+    """Combine semantic + BM25 retrieval with weighted score fusion."""
+    semantic_hits = semantic_searcher.search(query, top_k=top_k)
+    if bm25_searcher is None:
+        return semantic_hits
+
+    bm25_hits = bm25_searcher.search(query, top_k=top_k)
+
+    sem_max = max((float(getattr(h, "score", 0.0)) for h in semantic_hits), default=0.0)
+    bm_max = max((float(getattr(h, "score", 0.0)) for h in bm25_hits), default=0.0)
+    sem_denom = sem_max if sem_max > 0 else 1.0
+    bm_denom = bm_max if bm_max > 0 else 1.0
+
+    merged: dict[str, dict[str, Any]] = {}
+
+    for hit in semantic_hits:
+        listing_id = str(getattr(hit, "listing_id", ""))
+        merged[listing_id] = {
+            "listing_id": listing_id,
+            "remark": str(getattr(hit, "remark", "")),
+            "score": semantic_weight * (float(getattr(hit, "score", 0.0)) / sem_denom),
+        }
+
+    for hit in bm25_hits:
+        listing_id = str(getattr(hit, "listing_id", ""))
+        contribution = bm25_weight * (float(getattr(hit, "score", 0.0)) / bm_denom)
+        if listing_id in merged:
+            merged[listing_id]["score"] += contribution
+            if not merged[listing_id]["remark"]:
+                merged[listing_id]["remark"] = str(getattr(hit, "remark", ""))
+        else:
+            merged[listing_id] = {
+                "listing_id": listing_id,
+                "remark": str(getattr(hit, "remark", "")),
+                "score": contribution,
+            }
+
+    ranked = sorted(merged.values(), key=lambda row: row["score"], reverse=True)[:top_k]
+    return ranked
+
+
 # ---------------------------------------------------------------------------
 # FastAPI app + middleware
 # ---------------------------------------------------------------------------
@@ -517,6 +589,7 @@ async def search_listings(
     payload: SearchRequest,
     parser: QueryParser = Depends(get_query_parser),
     searcher: Any = Depends(get_semantic_searcher),
+    bm25_searcher: Any = Depends(get_bm25_searcher),
 ) -> SearchResponse:
     """Hybrid search: parse the query for structured filters, then retrieve
     semantically similar listings and post-filter by amenity constraints."""
@@ -527,7 +600,12 @@ async def search_listings(
 
     filters = parser.parse(payload.query)
     try:
-        raw_hits = searcher.search(payload.query, top_k=payload.top_k)
+        raw_hits = hybrid_retrieve(
+            payload.query,
+            top_k=payload.top_k,
+            semantic_searcher=searcher,
+            bm25_searcher=bm25_searcher,
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
@@ -758,11 +836,13 @@ __all__ = [
     "apply_filters",
     "TTLCache",
     "components",
+    "hybrid_retrieve",
     "get_query_parser",
     "get_entity_extractor",
     "get_summarizer",
     "get_compliance_checker",
     "get_submission_service",
     "get_semantic_searcher",
+    "get_bm25_searcher",
     "limiter",
 ]

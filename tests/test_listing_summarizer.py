@@ -46,6 +46,27 @@ def test_extract_summary_returns_compact_two_to_three_sentences():
     assert 2 <= len(sentences) <= 3
 
 
+def test_extractive_summary_omits_unmatched_features_and_location() -> None:
+    summarizer = ListingSummarizer()
+    listing = {
+        "city": "unknown",
+        "bedrooms": 2,
+        "bathrooms": 1,
+        "price": 410000,
+        "remarks": "Bright and clean home with plenty of natural light.",
+    }
+
+    summary = summarizer.extractive_summary(listing)
+    lowered = summary.lower()
+    header_sentence = summary.split(".", 1)[0].lower()
+
+    assert "in the listed area" not in lowered
+    assert "with strong curb appeal" not in lowered
+    assert "functional layout" not in lowered
+    assert " with " not in header_sentence
+    assert summary.startswith("2 bed, 1 bath home listed at $410,000.")
+
+
 def test_rouge_l_meets_threshold():
     summarizer = ListingSummarizer()
     listings = [

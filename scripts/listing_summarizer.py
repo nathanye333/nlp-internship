@@ -38,19 +38,25 @@ class ListingSummarizer:
     Extractive summaries always include:
     - beds/baths
     - price
-    - top 2 features (if available)
-    - location
+    - top 2 features (if confidently matched)
+    - location (when explicitly provided)
     """
 
     def extractive_summary(self, listing: Mapping[str, Any], num_sentences: int = 2) -> str:
         remarks = str(listing.get("remarks", "") or "").strip()
-        location = self._resolve_location(listing, remarks)
+        location = self._resolve_location(listing)
         beds = self._format_count(listing.get("bedrooms"))
         baths = self._format_count(listing.get("bathrooms"))
         price = self._format_price(listing.get("price"))
 
         features = self._extract_top_features(remarks, listing.get("features"))
-        header = f"{beds} bed, {baths} bath home in {location} listed at {price} with {self._format_features(features)}."
+        header = f"{beds} bed, {baths} bath home"
+        if location:
+            header += f" in {location}"
+        header += f" listed at {price}"
+        if features:
+            header += f" with {self._format_features(features)}"
+        header += "."
 
         ranked = self._rank_sentences(remarks, listing)
         detail_sentences = [s for _, _, s in ranked[: max(0, num_sentences - 1)]]
@@ -141,10 +147,6 @@ class ListingSummarizer:
         for feature in features:
             if feature not in ordered:
                 ordered.append(feature)
-        if not ordered:
-            return ["strong curb appeal", "functional layout"]
-        if len(ordered) == 1:
-            return [ordered[0], "modern finishes"]
         return ordered[:2]
 
     def _format_features(self, features: list[str]) -> str:
@@ -181,44 +183,10 @@ class ListingSummarizer:
                 return text
         return default
 
-    def _resolve_location(self, listing: Mapping[str, Any], remarks: str) -> str:
+    def _resolve_location(self, listing: Mapping[str, Any]) -> str | None:
         explicit = self._first_non_empty(listing, ("city", "location", "neighborhood"), default="").strip()
         if explicit.lower() not in _GENERIC_LOCATIONS:
             return explicit
-
-        inferred = self._extract_location_from_text(remarks)
-        if inferred:
-            return inferred
-        return "the listed area"
-
-    def _extract_location_from_text(self, remarks: str) -> str | None:
-        if not remarks:
-            return None
-
-        community_match = re.search(
-            r"\b([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,4})\s+(Community|Neighborhood|District|Village)\b",
-            remarks,
-        )
-        if community_match:
-            return f"{community_match.group(1)} {community_match.group(2)}"
-
-        downtown_match = re.search(
-            r"\bdowntown\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,3})",
-            remarks,
-            flags=re.I,
-        )
-        if downtown_match:
-            return f"Downtown {downtown_match.group(1)}"
-
-        in_match = re.search(
-            r"\b(?:in|near|around|within)\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,4})",
-            remarks,
-        )
-        if in_match:
-            candidate = in_match.group(1).strip()
-            if candidate.lower() not in {"the", "this", "a", "an"}:
-                return candidate
-
         return None
 
     def _tokenize(self, text: str) -> list[str]:
