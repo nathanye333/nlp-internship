@@ -1,0 +1,12 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.ipynb_checkpoints
+.git
+.gitignore
+.vscode
+.idea
+notebooks
+*.egg-info

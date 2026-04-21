@@ -10,5 +10,18 @@ services:
       - ./data/raw:/docker-entrypoint-initdb.d:ro
       - mysql_data:/var/lib/mysql
 
+  api:
+    build: .
+    image: nlp-internship-api:latest
+    ports:
+      - "8000:8000"
+    environment:
+      API_LOG_LEVEL: INFO
+    volumes:
+      - ./data:/app/data:ro
+    depends_on:
+      - mysql
+    restart: unless-stopped
+
 volumes:
   mysql_data:
