@@ -1,11 +1,35 @@
 from __future__ import annotations
 
+import csv
 import re
 from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
 from typing import Iterable
 
 
 _WS_RE = re.compile(r"\s+")
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_DEFAULT_LISTING_SAMPLE = _PROJECT_ROOT / "data" / "processed" / "listing_sample_cleaned.csv"
+
+
+@lru_cache(maxsize=1)
+def _known_city_lookup() -> dict[str, str]:
+    """Return lower-case city names mapped to their canonical dataset value."""
+    cities: dict[str, str] = {}
+    if _DEFAULT_LISTING_SAMPLE.exists():
+        with _DEFAULT_LISTING_SAMPLE.open(newline="", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                city = (row.get("L_City") or "").strip()
+                if city:
+                    cities[city.lower()] = city
+
+    # Common user shorthand mapped to the canonical value present in the data.
+    if "los angeles" in cities:
+        cities["la"] = cities["los angeles"]
+        cities["l.a."] = cities["los angeles"]
+    return cities
 
 
 @dataclass(frozen=True)
@@ -243,8 +267,26 @@ class QueryParser:
             self._set_min_max(filters, "bedrooms_min", "bedrooms_max", min(lo, hi), max(lo, hi))
             return
 
-        # "3+ bed", "at least 3 bedrooms"
+        # "under 3 bedrooms", "below 4 bed"
+        m = re.search(
+            r"(?:under|below|less than|<|at most|no more than)\s*(\d+)\s*(?:bed|beds|bedroom|bedrooms|br)\b",
+            q,
+            flags=re.I,
+        )
+        if m:
+            filters["bedrooms_max"] = int(m.group(1))
+            return
+
+        # "3+ bed", "at least 3 bedrooms", "over 2 bedrooms"
         m = re.search(r"(?:at least|min(?:imum)?)\s*(\d+)\s*(?:bed|beds|bedroom|bedrooms|br)\b", q, flags=re.I)
+        if m:
+            filters["bedrooms_min"] = int(m.group(1))
+            return
+        m = re.search(
+            r"(?:over|above|more than|>)\s*(\d+)\s*(?:bed|beds|bedroom|bedrooms|br)\b",
+            q,
+            flags=re.I,
+        )
         if m:
             filters["bedrooms_min"] = int(m.group(1))
             return
@@ -268,7 +310,24 @@ class QueryParser:
             self._set_min_max(filters, "bathrooms_min", "bathrooms_max", min(lo, hi), max(lo, hi))
             return
 
+        m = re.search(
+            r"(?:under|below|less than|<|at most|no more than)\s*(\d+(?:\.\d+)?)\s*(?:bath|baths|bathroom|bathrooms|ba)\b",
+            q,
+            flags=re.I,
+        )
+        if m:
+            filters["bathrooms_max"] = float(m.group(1))
+            return
+
         m = re.search(r"(?:at least|min(?:imum)?)\s*(\d+(?:\.\d+)?)\s*(?:bath|baths|bathroom|bathrooms|ba)\b", q, flags=re.I)
+        if m:
+            filters["bathrooms_min"] = float(m.group(1))
+            return
+        m = re.search(
+            r"(?:over|above|more than|>)\s*(\d+(?:\.\d+)?)\s*(?:bath|baths|bathroom|bathrooms|ba)\b",
+            q,
+            flags=re.I,
+        )
         if m:
             filters["bathrooms_min"] = float(m.group(1))
             return
@@ -299,6 +358,11 @@ class QueryParser:
         cleaned = _WS_RE.sub(" ", cleaned)
         if not cleaned:
             return None
+        lookup_key = cleaned.lower()
+        known_city = _known_city_lookup().get(lookup_key)
+        if known_city is not None:
+            return known_city
+
         # Title-case words, but keep short tokens upper (e.g. "LA")
         parts = []
         for w in cleaned.split(" "):
@@ -306,7 +370,8 @@ class QueryParser:
                 parts.append(w.upper())
             else:
                 parts.append(w[:1].upper() + w[1:].lower())
-        return " ".join(parts)
+        candidate = " ".join(parts)
+        return _known_city_lookup().get(candidate.lower())
 
     def _parse_amenities(self, q: str, filters: dict) -> None:
         inc: set[str] = set()

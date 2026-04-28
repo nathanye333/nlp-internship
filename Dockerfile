@@ -21,9 +21,30 @@ COPY docs ./docs
 COPY tests ./tests
 COPY pytest.ini ./
 
+# A single image runs both the FastAPI service and the Streamlit demo. Pick
+# which one with the ``RUN_MODE`` env variable (``api`` -- default -- or
+# ``ui``). ``PORT`` is read at runtime so the same image works on Render,
+# Railway, Fly, etc.
+ENV RUN_MODE=api \
+    PORT=8000
+
 EXPOSE 8000
+EXPOSE 8501
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD curl -fsS http://localhost:8000/health || exit 1
+  CMD sh -c 'if [ "$RUN_MODE" = "ui" ]; then \
+      curl -fsS http://localhost:${PORT:-8501}/_stcore/health || exit 1; \
+    else \
+      curl -fsS http://localhost:${PORT:-8000}/health || exit 1; \
+    fi'
 
-CMD ["uvicorn", "scripts.production_api:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "if [ \"$RUN_MODE\" = \"ui\" ]; then \
+    exec streamlit run scripts/product_demo.py \
+      --server.port=${PORT:-8501} \
+      --server.address=0.0.0.0 \
+      --server.headless=true \
+      --browser.gatherUsageStats=false; \
+  else \
+    exec uvicorn scripts.production_api:app \
+      --host 0.0.0.0 --port ${PORT:-8000}; \
+  fi"]

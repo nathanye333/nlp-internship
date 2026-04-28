@@ -30,12 +30,14 @@ import logging
 import os
 import sys
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from contextlib import asynccontextmanager
 from pathlib import Path
 from threading import Lock, RLock
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Deque, Literal, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -48,6 +50,10 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from scripts.compliance_checker import ComplianceChecker  # noqa: E402
 from scripts.entity_extractor import EntityExtractor  # noqa: E402
+from scripts.listing_metadata import (  # noqa: E402
+    ListingMetadataStore,
+    default_store as default_metadata_store,
+)
 from scripts.listing_submission_example import (  # noqa: E402
     Listing,
     ListingSubmissionError,
@@ -172,6 +178,7 @@ class _Components:
         self._searcher: Any = None
         self._bm25_searcher: Any = None
         self._searcher_error: Optional[str] = None
+        self._metadata_store: Optional[ListingMetadataStore] = None
 
     def query_parser(self) -> QueryParser:
         with self._lock:
@@ -246,13 +253,42 @@ class _Components:
                 ) from exc
 
     def bm25_searcher(self) -> Any:
-        """Return BM25 searcher built from semantic index metadata."""
+        """Return BM25 searcher built from saved remark metadata."""
         with self._lock:
             if self._bm25_searcher is not None:
                 return self._bm25_searcher
-            # Ensure semantic searcher is loaded first so corpus metadata exists.
+            meta_path = _PROJECT_ROOT / "data" / "models" / "listings_semantic_meta.json"
+            if meta_path.exists():
+                from scripts.semantic_searcher import BM25Searcher
+
+                metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+                bm25 = BM25Searcher()
+                bm25.build_index(
+                    metadata.get("remarks", []),
+                    listing_ids=metadata.get("listing_ids"),
+                )
+                self._bm25_searcher = bm25
+                return bm25
+            # Fall back to the semantic loader in older/dev setups where the
+            # BM25 corpus has not been materialized independently.
             self.semantic_searcher()
             return self._bm25_searcher
+
+    def warmup_semantic(self) -> None:
+        """Load semantic/BM25 components and run one tiny query embedding."""
+        searcher = self.semantic_searcher()
+        # ``load`` reads the FAISS index but leaves the sentence-transformer
+        # encoder lazy. A one-result search pays that model-load cost during
+        # startup instead of the first user-facing hybrid/semantic query.
+        searcher.search("__warmup__", top_k=1)
+        self.bm25_searcher()
+
+    def metadata_store(self) -> ListingMetadataStore:
+        """Return the listing metadata store (CSV-backed, lazy-loaded)."""
+        with self._lock:
+            if self._metadata_store is None:
+                self._metadata_store = default_metadata_store()
+            return self._metadata_store
 
     def reset(self) -> None:
         """Clear cached component instances. Used mainly by tests."""
@@ -265,6 +301,7 @@ class _Components:
             self._searcher = None
             self._bm25_searcher = None
             self._searcher_error = None
+            self._metadata_store = None
 
 
 components = _Components()
@@ -308,14 +345,30 @@ def get_bm25_searcher() -> Any:
         return None
 
 
+def get_metadata_store() -> ListingMetadataStore:
+    return components.metadata_store()
+
+
 # ---------------------------------------------------------------------------
 # Pydantic request / response models
 # ---------------------------------------------------------------------------
 
 
+SearchMode = Literal["hybrid", "semantic", "keyword"]
+CompareMode = Literal["semantic", "keyword", "hybrid", "bm25_raw"]
+
+
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=500, description="Free-text user query")
     top_k: int = Field(10, ge=1, le=100, description="Maximum results to return")
+    mode: SearchMode = Field(
+        "hybrid",
+        description=(
+            "Retrieval mode: 'hybrid' fuses semantic + BM25 scores, 'semantic' "
+            "returns only sentence-transformer results, 'keyword' returns only "
+            "BM25 (lexical) results."
+        ),
+    )
 
     @field_validator("query")
     @classmethod
@@ -337,7 +390,108 @@ class SearchResponse(BaseModel):
     filters: dict
     results: list[SearchHit]
     count: int
+    mode: SearchMode = "hybrid"
+    latency_ms: float = 0.0
     cached: bool = False
+
+
+class RawBM25SearchResponse(BaseModel):
+    query: str
+    filters: dict = Field(default_factory=dict)
+    results: list[SearchHit]
+    count: int
+    mode: Literal["bm25_raw"] = "bm25_raw"
+    latency_ms: float = 0.0
+    cached: bool = False
+
+
+class CompareRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=500)
+    top_k: int = Field(10, ge=1, le=50)
+
+    @field_validator("query")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("query must not be blank")
+        return v
+
+
+class CompareModeResult(BaseModel):
+    mode: CompareMode
+    results: list[SearchHit]
+    count: int
+    latency_ms: float
+    available: bool = True
+    error: Optional[str] = None
+
+
+class CompareOverlap(BaseModel):
+    semantic_vs_keyword: int
+    semantic_vs_hybrid: int
+    keyword_vs_hybrid: int
+    all_three: int
+
+
+class CompareResponse(BaseModel):
+    query: str
+    filters: dict
+    top_k: int
+    modes: dict[str, CompareModeResult]
+    overlap: CompareOverlap
+
+
+class ListingDetail(BaseModel):
+    listing_id: str
+    address: Optional[str] = None
+    city: Optional[str] = None
+    beds: Optional[float] = None
+    baths: Optional[float] = None
+    price: Optional[int] = None
+    remarks: Optional[str] = None
+    summary: Optional[str] = None
+    compliance_ok: Optional[bool] = None
+    compliance_error_count: int = 0
+    compliance_warning_count: int = 0
+    found: bool = True
+
+
+class FeedbackRequest(BaseModel):
+    listing_id: str = Field(..., min_length=1, max_length=64)
+    query: str = Field(..., min_length=1, max_length=500)
+    mode: SearchMode = "hybrid"
+    rating: int = Field(..., ge=-1, le=1, description="-1 thumbs down, 0 neutral, +1 thumbs up")
+    latency_ms: float = Field(0.0, ge=0.0)
+    note: Optional[str] = Field(None, max_length=500)
+
+
+class FeedbackResponse(BaseModel):
+    status: str
+    recorded_at: float
+    total_events: int
+
+
+class LatencyPercentiles(BaseModel):
+    p50: float
+    p95: float
+    p99: float
+    max: float
+    count: int
+
+
+class MetricsDashboardResponse(BaseModel):
+    query_volume_total: int
+    query_volume_last_hour: int
+    search_requests_total: int
+    feedback_events_total: int
+    satisfaction_proxy: Optional[float] = None
+    thumbs_up: int
+    thumbs_down: int
+    thumbs_neutral: int
+    latency_ms: LatencyPercentiles
+    cache: dict
+    mode_distribution: dict
 
 
 class ParseQueryRequest(BaseModel):
@@ -431,6 +585,168 @@ class HealthResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# In-process metrics + feedback log
+# ---------------------------------------------------------------------------
+
+
+_FEEDBACK_LOG_PATH = (
+    _PROJECT_ROOT / "data" / "processed" / "demo_event_log.jsonl"
+)
+
+
+class MetricsRegistry:
+    """Tiny thread-safe registry tracking request volume / latency / feedback.
+
+    The state lives in-process which is fine for the demo; for a real
+    deployment swap this for a Prometheus pull or push to Datadog.
+    """
+
+    LATENCY_WINDOW = 1024
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._latencies: Deque[float] = deque(maxlen=self.LATENCY_WINDOW)
+        self._request_timestamps: Deque[float] = deque(maxlen=4096)
+        self._search_requests = 0
+        self._mode_counts: dict[str, int] = {
+            "hybrid": 0,
+            "semantic": 0,
+            "keyword": 0,
+            "bm25_raw": 0,
+        }
+
+    def record_request(self, latency_ms: float, *, path: str = "") -> None:
+        with self._lock:
+            self._latencies.append(float(latency_ms))
+            self._request_timestamps.append(time.time())
+            if path.startswith("/search"):
+                self._search_requests += 1
+
+    def record_search_mode(self, mode: str) -> None:
+        with self._lock:
+            self._mode_counts[mode] = self._mode_counts.get(mode, 0) + 1
+
+    @staticmethod
+    def _percentile(values: list[float], pct: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        if len(ordered) == 1:
+            return ordered[0]
+        k = (len(ordered) - 1) * pct
+        lo = int(k)
+        hi = min(lo + 1, len(ordered) - 1)
+        frac = k - lo
+        return ordered[lo] + (ordered[hi] - ordered[lo]) * frac
+
+    def snapshot(self) -> dict:
+        now = time.time()
+        with self._lock:
+            latencies = list(self._latencies)
+            timestamps = list(self._request_timestamps)
+            search_total = self._search_requests
+            mode_counts = dict(self._mode_counts)
+        last_hour = sum(1 for ts in timestamps if now - ts <= 3600)
+        return {
+            "query_volume_total": len(timestamps),
+            "query_volume_last_hour": last_hour,
+            "search_requests_total": search_total,
+            "mode_distribution": mode_counts,
+            "latency_ms": {
+                "p50": self._percentile(latencies, 0.5),
+                "p95": self._percentile(latencies, 0.95),
+                "p99": self._percentile(latencies, 0.99),
+                "max": max(latencies) if latencies else 0.0,
+                "count": len(latencies),
+            },
+        }
+
+    def reset(self) -> None:
+        with self._lock:
+            self._latencies.clear()
+            self._request_timestamps.clear()
+            self._search_requests = 0
+            self._mode_counts = {
+                "hybrid": 0,
+                "semantic": 0,
+                "keyword": 0,
+                "bm25_raw": 0,
+            }
+
+
+metrics = MetricsRegistry()
+
+
+_feedback_lock = Lock()
+
+
+def feedback_log_path() -> Path:
+    """Return the JSONL path used to persist feedback events."""
+    return _FEEDBACK_LOG_PATH
+
+
+def set_feedback_log_path(path: Path | str) -> None:
+    """Override the feedback log path (used by tests)."""
+    global _FEEDBACK_LOG_PATH
+    _FEEDBACK_LOG_PATH = Path(path)
+
+
+def append_feedback_event(event: dict) -> int:
+    """Append ``event`` (already JSON-serialisable) to the feedback log.
+
+    Returns the new total number of events on disk.
+    """
+    path = feedback_log_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(event, default=str)
+    with _feedback_lock:
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+        return _count_feedback_events_unlocked(path)
+
+
+def _count_feedback_events_unlocked(path: Path) -> int:
+    if not path.exists():
+        return 0
+    with path.open("r", encoding="utf-8") as fh:
+        return sum(1 for line in fh if line.strip())
+
+
+def aggregate_feedback() -> dict:
+    """Aggregate the feedback JSONL into satisfaction counts."""
+    path = feedback_log_path()
+    up = down = neutral = total = 0
+    if path.exists():
+        with _feedback_lock:
+            with path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    total += 1
+                    rating = event.get("rating")
+                    if rating == 1:
+                        up += 1
+                    elif rating == -1:
+                        down += 1
+                    else:
+                        neutral += 1
+    decided = up + down
+    proxy = (up / decided) if decided > 0 else None
+    return {
+        "feedback_events_total": total,
+        "thumbs_up": up,
+        "thumbs_down": down,
+        "thumbs_neutral": neutral,
+        "satisfaction_proxy": proxy,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -443,6 +759,9 @@ def apply_filters(results: list, filters: dict) -> list:
     Numeric filters (price / beds / baths / city) are returned in the
     ``filters`` field of the response for downstream SQL execution; we do not
     have the metadata loaded in-process to filter on them.
+
+    Accepts either attribute-style hits (e.g. ``SearchResult`` dataclasses)
+    or dict-style hits emitted by :func:`hybrid_retrieve` / :func:`run_search`.
     """
 
     if not results:
@@ -454,7 +773,8 @@ def apply_filters(results: list, filters: dict) -> list:
 
     filtered: list = []
     for r in results:
-        remark_lower = (getattr(r, "remark", "") or "").lower()
+        remark = _hit_field(r, "remark", "")
+        remark_lower = (remark or "").lower()
         if includes and not all(token in remark_lower for token in includes):
             continue
         if excludes and any(token in remark_lower for token in excludes):
@@ -463,21 +783,293 @@ def apply_filters(results: list, filters: dict) -> list:
     return filtered
 
 
+def _amenity_filters_present(filters: dict) -> bool:
+    return bool(filters.get("amenities_in") or filters.get("amenities_out"))
+
+
+def _metadata_filters_present(filters: dict) -> bool:
+    """Return True when filters require structured listing metadata."""
+    keys = {
+        "price_min",
+        "price_max",
+        "bedrooms_min",
+        "bedrooms_max",
+        "bathrooms_min",
+        "bathrooms_max",
+        "city",
+    }
+    return any(key in filters for key in keys)
+
+
+def _matches_range(
+    value: Any,
+    *,
+    minimum: Any = None,
+    maximum: Any = None,
+) -> bool:
+    if minimum is None and maximum is None:
+        return True
+    if value is None:
+        return False
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return False
+    if minimum is not None and numeric < float(minimum):
+        return False
+    if maximum is not None and numeric > float(maximum):
+        return False
+    return True
+
+
+def listing_matches_metadata_filters(record: dict | None, filters: dict) -> bool:
+    """Evaluate parsed query filters against a listing metadata record.
+
+    This mirrors the SQL generated by :class:`QueryParser` for the fields we
+    have in ``listing_sample_cleaned.csv``. Missing metadata is treated as
+    non-matching when a structured constraint is present.
+    """
+    if not _metadata_filters_present(filters):
+        return True
+    if record is None:
+        return False
+
+    city = filters.get("city")
+    if city is not None:
+        record_city = (record.get("city") or "").strip().lower()
+        if record_city != str(city).strip().lower():
+            return False
+
+    if not _matches_range(
+        record.get("price"),
+        minimum=filters.get("price_min"),
+        maximum=filters.get("price_max"),
+    ):
+        return False
+    if not _matches_range(
+        record.get("beds"),
+        minimum=filters.get("bedrooms_min"),
+        maximum=filters.get("bedrooms_max"),
+    ):
+        return False
+    if not _matches_range(
+        record.get("baths"),
+        minimum=filters.get("bathrooms_min"),
+        maximum=filters.get("bathrooms_max"),
+    ):
+        return False
+
+    return True
+
+
+def listing_matches_query_filters(record: dict | None, filters: dict) -> bool:
+    """Evaluate the parsed SQL-like constraints against one listing record."""
+    if record is None:
+        return False
+    if not listing_matches_metadata_filters(record, filters):
+        return False
+    if _amenity_filters_present(filters):
+        remark_lower = (
+            (record.get("remarks_clean") or record.get("remarks") or "").lower()
+        )
+        includes = [a.lower() for a in filters.get("amenities_in", []) or []]
+        excludes = [a.lower() for a in filters.get("amenities_out", []) or []]
+        if includes and not all(token in remark_lower for token in includes):
+            return False
+        if excludes and any(token in remark_lower for token in excludes):
+            return False
+    return True
+
+
+def candidate_listing_ids(
+    filters: dict,
+    metadata_store: ListingMetadataStore | None,
+) -> set[str] | None:
+    """Return the SQL-eligible candidate listing IDs before retrieval.
+
+    If no structured/amenity filters are present we return ``None`` so the
+    searchers operate over the full corpus. Otherwise, only listings matching
+    the parsed query constraints are eligible for semantic/BM25 ranking.
+    """
+    if metadata_store is None:
+        return set()
+    if not (_metadata_filters_present(filters) or _amenity_filters_present(filters)):
+        return None
+    return {
+        listing_id
+        for listing_id, record in metadata_store.all_records().items()
+        if listing_matches_query_filters(record, filters)
+    }
+
+
+def apply_metadata_filters(
+    results: list,
+    filters: dict,
+    metadata_store: ListingMetadataStore | None,
+) -> list:
+    """Filter search hits by parsed city / price / beds / baths constraints."""
+    if not results or not _metadata_filters_present(filters):
+        return results
+    if metadata_store is None:
+        return []
+
+    filtered: list = []
+    for hit in results:
+        listing_id = str(_hit_field(hit, "listing_id", ""))
+        record = metadata_store.get(listing_id)
+        if listing_matches_metadata_filters(record, filters):
+            filtered.append(hit)
+    return filtered
+
+
+def retrieval_depth(top_k: int, filters: dict, metadata_store: ListingMetadataStore | None) -> int:
+    """Fetch a wider candidate pool when structured filters are present.
+
+    The persisted FAISS/BM25 searchers do not support a true SQL pre-filter,
+    so the next-best behaviour is to over-retrieve, apply metadata filters
+    before final truncation, then return top-k from the filtered candidates.
+    """
+    if not _metadata_filters_present(filters):
+        return top_k
+    corpus_size = len(metadata_store) if metadata_store is not None else 0
+    if corpus_size <= 0:
+        return max(top_k * 10, 100)
+    return min(corpus_size, max(top_k * 25, 250))
+
+
+def _hit_field(item: Any, field: str, default: Any = "") -> Any:
+    """Read ``field`` from either an attribute-style hit or a dict-style hit."""
+    if isinstance(item, dict):
+        return item.get(field, default)
+    return getattr(item, field, default)
+
+
+def _normalize_hits(items: list) -> list[dict]:
+    """Normalise a heterogeneous list of search hits to dicts."""
+    return [
+        {
+            "listing_id": str(_hit_field(item, "listing_id", "")),
+            "remark": str(_hit_field(item, "remark", "")),
+            "score": float(_hit_field(item, "score", 0.0)),
+        }
+        for item in items
+    ]
+
+
+HYBRID_SEMANTIC_WEIGHT = 0.93
+HYBRID_BM25_WEIGHT = 0.07
+
+
+def _search_with_candidates(
+    searcher: Any,
+    query: str,
+    *,
+    top_k: int,
+    allowed_listing_ids: set[str] | None = None,
+) -> Any:
+    """Call a searcher with candidate IDs when supported, else fall back."""
+    if allowed_listing_ids is None:
+        return searcher.search(query, top_k=top_k)
+    try:
+        return searcher.search(
+            query,
+            top_k=top_k,
+            allowed_listing_ids=allowed_listing_ids,
+        )
+    except TypeError:
+        # Test stubs and older searcher implementations may not yet accept the
+        # allowlist kwarg. Fall back to the legacy signature.
+        return searcher.search(query, top_k=top_k)
+
+
+def run_search(
+    query: str,
+    *,
+    mode: SearchMode,
+    top_k: int,
+    semantic_searcher: Any,
+    bm25_searcher: Any | None,
+    allowed_listing_ids: set[str] | None = None,
+) -> list[dict]:
+    """Dispatch to the requested retrieval mode and return normalised hits."""
+    if mode == "semantic":
+        if semantic_searcher is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Semantic searcher unavailable for semantic mode",
+            )
+        return _normalize_hits(
+            _search_with_candidates(
+                semantic_searcher,
+                query,
+                top_k=top_k,
+                allowed_listing_ids=allowed_listing_ids,
+            )
+        )
+    if mode == "keyword":
+        if bm25_searcher is None:
+            raise HTTPException(
+                status_code=503,
+                detail="BM25 searcher unavailable for keyword mode",
+            )
+        return _normalize_hits(
+            _search_with_candidates(
+                bm25_searcher,
+                query,
+                top_k=top_k,
+                allowed_listing_ids=allowed_listing_ids,
+            )
+        )
+    if mode == "hybrid":
+        if semantic_searcher is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Semantic searcher unavailable for hybrid mode",
+            )
+        return _normalize_hits(
+            hybrid_retrieve(
+                query,
+                top_k=top_k,
+                semantic_searcher=semantic_searcher,
+                bm25_searcher=bm25_searcher,
+                allowed_listing_ids=allowed_listing_ids,
+            )
+        )
+    raise HTTPException(status_code=400, detail=f"unknown mode: {mode}")
+
+
 def hybrid_retrieve(
     query: str,
     *,
     top_k: int,
     semantic_searcher: Any,
     bm25_searcher: Any | None = None,
-    semantic_weight: float = 0.7,
-    bm25_weight: float = 0.3,
+    allowed_listing_ids: set[str] | None = None,
+    semantic_weight: float = HYBRID_SEMANTIC_WEIGHT,
+    bm25_weight: float = HYBRID_BM25_WEIGHT,
 ) -> list:
-    """Combine semantic + BM25 retrieval with weighted score fusion."""
-    semantic_hits = semantic_searcher.search(query, top_k=top_k)
+    """Combine semantic + BM25 retrieval with weighted score fusion.
+
+    The default weights were tuned offline on
+    ``data/processed/relevance_pairs_labeled_auto.csv`` via a simple grid
+    search over mean NDCG@5 / MAP@5. On the current labeled set, the best
+    setting was heavily semantic-weighted.
+    """
+    semantic_hits = _search_with_candidates(
+        semantic_searcher,
+        query,
+        top_k=top_k,
+        allowed_listing_ids=allowed_listing_ids,
+    )
     if bm25_searcher is None:
         return semantic_hits
 
-    bm25_hits = bm25_searcher.search(query, top_k=top_k)
+    bm25_hits = _search_with_candidates(
+        bm25_searcher,
+        query,
+        top_k=top_k,
+        allowed_listing_ids=allowed_listing_ids,
+    )
 
     sem_max = max((float(getattr(h, "score", 0.0)) for h in semantic_hits), default=0.0)
     bm_max = max((float(getattr(h, "score", 0.0)) for h in bm25_hits), default=0.0)
@@ -521,6 +1113,39 @@ API_VERSION = "1.0.0"
 
 limiter = Limiter(key_func=get_remote_address, default_limits=["10/second"])
 
+
+def _should_warmup_semantic() -> bool:
+    if os.environ.get("API_WARMUP_SEMANTIC", "1").lower() in {"0", "false", "no"}:
+        return False
+    # Keep tests fast and independent from heavyweight FAISS/transformer setup.
+    return "PYTEST_CURRENT_TEST" not in os.environ
+
+
+def _warmup_components_for_startup() -> None:
+    """Move semantic model cold-start cost from first search to API startup."""
+    if not _should_warmup_semantic():
+        return
+    try:
+        started = time.perf_counter()
+        components.warmup_semantic()
+        # Load the CSV metadata too so the first filtered query avoids disk IO.
+        len(components.metadata_store())
+        logger.info(
+            "semantic_warmup_complete elapsed_ms=%.2f",
+            (time.perf_counter() - started) * 1000.0,
+        )
+    except HTTPException as exc:
+        logger.warning("semantic_warmup_skipped detail=%s", exc.detail)
+    except Exception:
+        logger.exception("semantic_warmup_failed")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):  # noqa: ARG001
+    _warmup_components_for_startup()
+    yield
+
+
 app = FastAPI(
     title="Real Estate NLP API",
     description=(
@@ -529,12 +1154,24 @@ app = FastAPI(
         "compliance checking."
     ),
     version=API_VERSION,
+    lifespan=lifespan,
 )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, lambda request, exc: JSONResponse(
     status_code=429,
     content={"detail": "Rate limit exceeded"},
 ))
+
+# Permissive CORS so the Streamlit demo (or a static React build) can talk to
+# the API when both are deployed on different Render services.
+_ALLOWED_ORIGINS = os.environ.get("API_CORS_ORIGINS", "*").split(",")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in _ALLOWED_ORIGINS if o.strip()] or ["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.middleware("http")
@@ -544,6 +1181,7 @@ async def log_requests(request: Request, call_next: Callable) -> Any:
         response = await call_next(request)
     except Exception:
         elapsed_ms = (time.perf_counter() - start) * 1000.0
+        metrics.record_request(elapsed_ms, path=request.url.path)
         logger.exception(
             "request_error method=%s path=%s client=%s elapsed_ms=%.2f",
             request.method,
@@ -553,6 +1191,7 @@ async def log_requests(request: Request, call_next: Callable) -> Any:
         )
         raise
     elapsed_ms = (time.perf_counter() - start) * 1000.0
+    metrics.record_request(elapsed_ms, path=request.url.path)
     logger.info(
         "request method=%s path=%s client=%s status=%s elapsed_ms=%.2f",
         request.method,
@@ -590,33 +1229,55 @@ async def search_listings(
     parser: QueryParser = Depends(get_query_parser),
     searcher: Any = Depends(get_semantic_searcher),
     bm25_searcher: Any = Depends(get_bm25_searcher),
+    metadata_store: ListingMetadataStore = Depends(get_metadata_store),
 ) -> SearchResponse:
-    """Hybrid search: parse the query for structured filters, then retrieve
-    semantically similar listings and post-filter by amenity constraints."""
+    """Mode-aware search: parse the query for structured filters, then retrieve
+    listings via hybrid / semantic / keyword retrieval and post-filter by
+    amenity constraints. ``payload.mode`` selects the retrieval strategy."""
+    metrics.record_search_mode(payload.mode)
     key = _cache_key("search", payload.model_dump())
     cached = _cache.get(key)
     if cached is not None:
         return SearchResponse(**cached, cached=True)
 
     filters = parser.parse(payload.query)
+    allowed_listing_ids = candidate_listing_ids(filters, metadata_store)
+    if allowed_listing_ids == set():
+        body = {
+            "query": payload.query,
+            "filters": filters,
+            "results": [],
+            "count": 0,
+            "mode": payload.mode,
+            "latency_ms": 0.0,
+        }
+        _cache.set(key, body)
+        return SearchResponse(**body, cached=False)
+    started = time.perf_counter()
     try:
-        raw_hits = hybrid_retrieve(
+        raw_hits = run_search(
             payload.query,
+            mode=payload.mode,
             top_k=payload.top_k,
             semantic_searcher=searcher,
             bm25_searcher=bm25_searcher,
+            allowed_listing_ids=allowed_listing_ids,
         )
+    except HTTPException:
+        raise
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    filtered = apply_filters(raw_hits, filters)
+    filtered = apply_filters(raw_hits, filters)[: payload.top_k]
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+
     hits = [
         SearchHit(
-            listing_id=str(getattr(r, "listing_id", "")),
-            remark=str(getattr(r, "remark", "")),
-            score=float(getattr(r, "score", 0.0)),
+            listing_id=str(_hit_field(r, "listing_id", "")),
+            remark=str(_hit_field(r, "remark", "")),
+            score=float(_hit_field(r, "score", 0.0)),
         )
         for r in filtered
     ]
@@ -626,9 +1287,289 @@ async def search_listings(
         "filters": filters,
         "results": [h.model_dump() for h in hits],
         "count": len(hits),
+        "mode": payload.mode,
+        "latency_ms": round(elapsed_ms, 3),
     }
     _cache.set(key, body)
     return SearchResponse(**body, cached=False)
+
+
+@app.post("/search/bm25", response_model=RawBM25SearchResponse, tags=["search"])
+@limiter.limit("10/second")
+async def search_bm25_raw(
+    request: Request,
+    payload: CompareRequest,
+    bm25_searcher: Any = Depends(get_bm25_searcher),
+) -> RawBM25SearchResponse:
+    """Pure BM25 keyword search for demo comparison.
+
+    This intentionally skips the query parser, structured metadata filters,
+    amenity filters, semantic search, hybrid fusion, and summarization.
+    """
+    metrics.record_search_mode("bm25_raw")
+    key = _cache_key("search_bm25_raw", payload.model_dump())
+    cached = _cache.get(key)
+    if cached is not None:
+        return RawBM25SearchResponse(**cached, cached=True)
+    if bm25_searcher is None:
+        raise HTTPException(status_code=503, detail="BM25 searcher unavailable")
+
+    started = time.perf_counter()
+    try:
+        raw_hits = bm25_searcher.search(payload.query, top_k=payload.top_k)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+
+    hits = [
+        SearchHit(
+            listing_id=str(_hit_field(r, "listing_id", "")),
+            remark=str(_hit_field(r, "remark", "")),
+            score=float(_hit_field(r, "score", 0.0)),
+        )
+        for r in raw_hits
+    ]
+    body = {
+        "query": payload.query,
+        "filters": {},
+        "results": [h.model_dump() for h in hits],
+        "count": len(hits),
+        "mode": "bm25_raw",
+        "latency_ms": round(elapsed_ms, 3),
+    }
+    _cache.set(key, body)
+    return RawBM25SearchResponse(**body, cached=False)
+
+
+@app.post("/search/compare", response_model=CompareResponse, tags=["search"])
+@limiter.limit("5/second")
+async def compare_search(
+    request: Request,
+    payload: CompareRequest,
+    parser: QueryParser = Depends(get_query_parser),
+    searcher: Any = Depends(get_semantic_searcher),
+    bm25_searcher: Any = Depends(get_bm25_searcher),
+    metadata_store: ListingMetadataStore = Depends(get_metadata_store),
+) -> CompareResponse:
+    """Run all three retrieval modes in one call and report per-mode latency
+    plus pairwise overlap between top-k result sets. This powers the side-by-
+    side comparison tab in the demo UI."""
+    key = _cache_key("search_compare", payload.model_dump())
+    cached = _cache.get(key)
+    if cached is not None:
+        return CompareResponse(**cached)
+
+    filters = parser.parse(payload.query)
+    allowed_listing_ids = candidate_listing_ids(filters, metadata_store)
+    modes: list[CompareMode] = ["semantic", "keyword", "hybrid", "bm25_raw"]
+    results: dict[str, CompareModeResult] = {}
+    listing_sets: dict[str, set[str]] = {}
+
+    for mode in modes:
+        metrics.record_search_mode(mode)
+        started = time.perf_counter()
+        try:
+            if mode == "bm25_raw":
+                if bm25_searcher is None:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="BM25 searcher unavailable for raw BM25 mode",
+                    )
+                raw = _normalize_hits(
+                    bm25_searcher.search(payload.query, top_k=payload.top_k)
+                )
+            else:
+                raw = run_search(
+                    payload.query,
+                    mode=mode,
+                    top_k=payload.top_k,
+                    semantic_searcher=searcher,
+                    bm25_searcher=bm25_searcher,
+                    allowed_listing_ids=allowed_listing_ids,
+                )
+        except HTTPException as exc:
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            results[mode] = CompareModeResult(
+                mode=mode,
+                results=[],
+                count=0,
+                latency_ms=round(elapsed_ms, 3),
+                available=False,
+                error=str(exc.detail),
+            )
+            listing_sets[mode] = set()
+            continue
+        if mode == "bm25_raw":
+            filtered = raw[: payload.top_k]
+        else:
+            filtered = apply_filters(raw, filters)[: payload.top_k]
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        hits = [
+            SearchHit(
+                listing_id=str(_hit_field(r, "listing_id", "")),
+                remark=str(_hit_field(r, "remark", "")),
+                score=float(_hit_field(r, "score", 0.0)),
+            )
+            for r in filtered
+        ]
+        results[mode] = CompareModeResult(
+            mode=mode,
+            results=hits,
+            count=len(hits),
+            latency_ms=round(elapsed_ms, 3),
+            available=True,
+        )
+        listing_sets[mode] = {h.listing_id for h in hits}
+
+    sem = listing_sets.get("semantic", set())
+    kw = listing_sets.get("keyword", set())
+    hy = listing_sets.get("hybrid", set())
+    overlap = CompareOverlap(
+        semantic_vs_keyword=len(sem & kw),
+        semantic_vs_hybrid=len(sem & hy),
+        keyword_vs_hybrid=len(kw & hy),
+        all_three=len(sem & kw & hy),
+    )
+
+    body = CompareResponse(
+        query=payload.query,
+        filters=filters,
+        top_k=payload.top_k,
+        modes=results,
+        overlap=overlap,
+    ).model_dump()
+    _cache.set(key, body)
+    return CompareResponse(**body)
+
+
+@app.get("/listings/{listing_id}", response_model=ListingDetail, tags=["search"])
+@limiter.limit("20/second")
+async def get_listing_detail(
+    request: Request,
+    listing_id: str,
+    store: ListingMetadataStore = Depends(get_metadata_store),
+    summarizer: ListingSummarizer = Depends(get_summarizer),
+    checker: ComplianceChecker = Depends(get_compliance_checker),
+) -> ListingDetail:
+    """Enrich a search hit with structured metadata (address, price, beds,
+    baths) and a short extractive summary."""
+    key = _cache_key("listing_detail", {"listing_id": listing_id})
+    cached = _cache.get(key)
+    if cached is not None:
+        return ListingDetail(**cached)
+
+    record = store.get(listing_id)
+    if record is None:
+        # Return a 'not found' shaped response rather than 404 so the UI can
+        # gracefully render listings whose metadata was never persisted.
+        body = ListingDetail(listing_id=listing_id, found=False).model_dump()
+        _cache.set(key, body)
+        return ListingDetail(**body)
+
+    summary: Optional[str] = None
+    compliance_ok: Optional[bool] = None
+    compliance_error_count = 0
+    compliance_warning_count = 0
+    remarks_text = record.get("remarks_clean") or record.get("remarks") or ""
+    if remarks_text:
+        try:
+            summary = summarizer.extractive_summary(
+                {
+                    "remarks": remarks_text,
+                    "bedrooms": record.get("beds"),
+                    "bathrooms": record.get("baths"),
+                    "price": record.get("price"),
+                    "city": record.get("city"),
+                },
+                num_sentences=2,
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("extractive summary failed for %s", listing_id)
+            summary = None
+        try:
+            compliance_report = checker.check_listing(remarks_text)
+            compliance_ok = compliance_report.compliant
+            compliance_error_count = compliance_report.error_count
+            compliance_warning_count = compliance_report.warning_count
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("compliance check failed for %s", listing_id)
+
+    body = ListingDetail(
+        listing_id=str(record.get("listing_id", listing_id)),
+        address=record.get("address"),
+        city=record.get("city"),
+        beds=record.get("beds"),
+        baths=record.get("baths"),
+        price=record.get("price"),
+        remarks=record.get("remarks"),
+        summary=summary,
+        compliance_ok=compliance_ok,
+        compliance_error_count=compliance_error_count,
+        compliance_warning_count=compliance_warning_count,
+        found=True,
+    ).model_dump()
+    _cache.set(key, body)
+    return ListingDetail(**body)
+
+
+@app.post("/feedback", response_model=FeedbackResponse, tags=["meta"])
+@limiter.limit("20/second")
+async def submit_feedback(
+    request: Request,
+    payload: FeedbackRequest,
+) -> FeedbackResponse:
+    """Persist a user feedback event (thumbs up / down on a search result).
+
+    Events are appended as JSONL to ``data/processed/demo_event_log.jsonl``
+    and surfaced as a satisfaction proxy via ``/metrics/dashboard``.
+    """
+    event = {
+        "ts": time.time(),
+        "listing_id": payload.listing_id,
+        "query": payload.query,
+        "mode": payload.mode,
+        "rating": payload.rating,
+        "latency_ms": payload.latency_ms,
+        "note": payload.note,
+        "client": request.client.host if request.client else None,
+    }
+    total = append_feedback_event(event)
+    return FeedbackResponse(
+        status="recorded",
+        recorded_at=event["ts"],
+        total_events=total,
+    )
+
+
+@app.get(
+    "/metrics/dashboard",
+    response_model=MetricsDashboardResponse,
+    tags=["meta"],
+)
+@limiter.limit("20/second")
+async def metrics_dashboard(request: Request) -> MetricsDashboardResponse:
+    """Aggregated metrics for the demo dashboard tab.
+
+    Combines the in-process latency / volume registry with the JSONL feedback
+    log and the response cache statistics.
+    """
+    snapshot = metrics.snapshot()
+    feedback = aggregate_feedback()
+    return MetricsDashboardResponse(
+        query_volume_total=snapshot["query_volume_total"],
+        query_volume_last_hour=snapshot["query_volume_last_hour"],
+        search_requests_total=snapshot["search_requests_total"],
+        feedback_events_total=feedback["feedback_events_total"],
+        satisfaction_proxy=feedback["satisfaction_proxy"],
+        thumbs_up=feedback["thumbs_up"],
+        thumbs_down=feedback["thumbs_down"],
+        thumbs_neutral=feedback["thumbs_neutral"],
+        latency_ms=LatencyPercentiles(**snapshot["latency_ms"]),
+        cache=_cache.stats(),
+        mode_distribution=snapshot["mode_distribution"],
+    )
 
 
 @app.post("/parse-query", response_model=ParseQueryResponse, tags=["nlp"])
@@ -837,6 +1778,7 @@ __all__ = [
     "TTLCache",
     "components",
     "hybrid_retrieve",
+    "run_search",
     "get_query_parser",
     "get_entity_extractor",
     "get_summarizer",
@@ -844,5 +1786,12 @@ __all__ = [
     "get_submission_service",
     "get_semantic_searcher",
     "get_bm25_searcher",
+    "get_metadata_store",
     "limiter",
+    "metrics",
+    "MetricsRegistry",
+    "feedback_log_path",
+    "set_feedback_log_path",
+    "append_feedback_event",
+    "aggregate_feedback",
 ]

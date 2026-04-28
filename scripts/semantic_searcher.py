@@ -53,6 +53,8 @@ class SemanticSearcher:
         self.listing_ids: list[str] = []
         self.remarks: list[str] = []
         self.embedding_dim: int | None = None
+        self._vectors: np.ndarray | None = None
+        self._id_to_index: dict[str, int] = {}
 
     @property
     def is_ready(self) -> bool:
@@ -101,8 +103,16 @@ class SemanticSearcher:
         self.embedding_dim = int(vectors.shape[1])
         self.index = faiss.IndexFlatIP(self.embedding_dim)
         self.index.add(vectors)  # pyright: ignore[reportCallIssue]
+        self._vectors = vectors
+        self._id_to_index = {listing_id: idx for idx, listing_id in enumerate(self.listing_ids)}
 
-    def search(self, query: str, top_k: int = 10) -> list[SearchResult]:
+    def search(
+        self,
+        query: str,
+        top_k: int = 10,
+        *,
+        allowed_listing_ids: Sequence[str] | set[str] | None = None,
+    ) -> list[SearchResult]:
         if not self.is_ready or self.index is None:
             raise RuntimeError("Index is not built. Call build_index first.")
         if top_k <= 0:
@@ -111,6 +121,27 @@ class SemanticSearcher:
         encoder = self._ensure_encoder()
         query_vectors = encoder.encode([query], show_progress_bar=False)
         query_vectors = self._normalize_embeddings(query_vectors)
+        if allowed_listing_ids is not None:
+            if self._vectors is None:
+                raise RuntimeError("Embedding matrix not available.")
+            subset_indices = [
+                self._id_to_index[str(listing_id)]
+                for listing_id in allowed_listing_ids
+                if str(listing_id) in self._id_to_index
+            ]
+            if not subset_indices:
+                return []
+            subset_vectors = self._vectors[np.asarray(subset_indices, dtype=np.int32)]
+            scores = subset_vectors @ query_vectors[0]
+            ranked_local = np.argsort(scores)[::-1][: min(top_k, len(subset_indices))]
+            return [
+                SearchResult(
+                    listing_id=self.listing_ids[subset_indices[idx]],
+                    remark=self.remarks[subset_indices[idx]],
+                    score=float(scores[idx]),
+                )
+                for idx in ranked_local
+            ]
         scores, indices = self.index.search(  # pyright: ignore[reportCallIssue]
             query_vectors,
             min(top_k, len(self.remarks)),
@@ -157,6 +188,19 @@ class SemanticSearcher:
         self.embedding_dim = int(metadata["embedding_dim"])
         self.listing_ids = [str(v) for v in metadata["listing_ids"]]
         self.remarks = [str(v) for v in metadata["remarks"]]
+        self._id_to_index = {listing_id: idx for idx, listing_id in enumerate(self.listing_ids)}
+        if self.index is not None and self.listing_ids:
+            self._vectors = np.vstack(
+                [
+                    np.asarray(
+                        self.index.reconstruct(i),  # pyright: ignore[reportCallIssue]
+                        dtype=np.float32,
+                    )
+                    for i in range(len(self.listing_ids))
+                ]
+            )
+        else:
+            self._vectors = None
 
 
 class BM25Searcher:
@@ -172,6 +216,7 @@ class BM25Searcher:
         self._doc_lengths: list[int] = []
         self._idf: dict[str, float] = {}
         self._avgdl: float = 0.0
+        self._id_to_index: dict[str, int] = {}
 
     @staticmethod
     def tokenize(text: str) -> list[str]:
@@ -187,6 +232,7 @@ class BM25Searcher:
             if len(listing_ids) != len(self.remarks):
                 raise ValueError("listing_ids length must match remarks length.")
             self.listing_ids = [str(v) for v in listing_ids]
+        self._id_to_index = {listing_id: idx for idx, listing_id in enumerate(self.listing_ids)}
 
         self._doc_tokens = [self.tokenize(text) for text in self.remarks]
         self._doc_lengths = [len(tokens) for tokens in self._doc_tokens]
@@ -207,7 +253,13 @@ class BM25Searcher:
         for term, df in doc_freq.items():
             self._idf[term] = math.log((n_docs - df + 0.5) / (df + 0.5) + 1.0)
 
-    def search(self, query: str, top_k: int = 10) -> list[SearchResult]:
+    def search(
+        self,
+        query: str,
+        top_k: int = 10,
+        *,
+        allowed_listing_ids: Sequence[str] | set[str] | None = None,
+    ) -> list[SearchResult]:
         if not self.remarks:
             raise RuntimeError("BM25 index not built. Call build_index first.")
         if top_k <= 0:
@@ -217,8 +269,19 @@ class BM25Searcher:
         if not q_terms:
             return []
 
+        candidate_indices = list(range(len(self.remarks)))
+        if allowed_listing_ids is not None:
+            candidate_indices = [
+                self._id_to_index[str(listing_id)]
+                for listing_id in allowed_listing_ids
+                if str(listing_id) in self._id_to_index
+            ]
+            if not candidate_indices:
+                return []
+
         scores = np.zeros(len(self.remarks), dtype=np.float32)
-        for i, term_freqs in enumerate(self._doc_term_freqs):
+        for i in candidate_indices:
+            term_freqs = self._doc_term_freqs[i]
             score = 0.0
             dl = self._doc_lengths[i]
             denom_norm = self.k1 * (1.0 - self.b + self.b * dl / max(self._avgdl, 1e-9))

@@ -69,6 +69,16 @@ class AnswerabilityChecker:
                 ],
             )
 
+        unsupported_location = self._unsupported_location_phrase(clean_query, filters)
+        if unsupported_location:
+            return AnswerabilityResult(
+                answerable=False,
+                reason="Unsupported filter values",
+                details=[
+                    f"City/location '{unsupported_location}' is not a supported city."
+                ],
+            )
+
         if self.validator is not None:
             valid, errors = self.validator.validate_query(filters)
             if not valid:
@@ -112,6 +122,32 @@ class AnswerabilityChecker:
             )
 
         return AnswerabilityResult(answerable=True, reason="Results found", details=[])
+
+    def _unsupported_location_phrase(
+        self,
+        query: str,
+        filters: dict[str, Any],
+    ) -> str | None:
+        """Detect location phrases the parser intentionally refused as cities."""
+        if "city" in filters:
+            return None
+        m = re.search(
+            r"\b(?:in|near|around|within)\s+([a-z][a-z\s\.\-']{1,50})\b",
+            query,
+            flags=re.I,
+        )
+        if not m:
+            return None
+        raw = m.group(1).strip()
+        raw = re.split(
+            r"\b(?:under|below|over|above|with|without|no|not|between|from)\b",
+            raw,
+            maxsplit=1,
+            flags=re.I,
+        )[0].strip()
+        cleaned = re.sub(r"[^a-zA-Z\s\.\-']", "", raw).strip()
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned or None
 
     def _validate_taxonomy_values(self, filters: dict[str, Any]) -> list[str]:
         errors: list[str] = []

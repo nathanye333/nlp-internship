@@ -1,0 +1,47 @@
+# Render Blueprint for the Real Estate NLP demo (Week 11).
+#
+# This file provisions two web services from the same Dockerfile:
+#
+#   * nlp-api : FastAPI backend (RUN_MODE=api, $PORT supplied by Render)
+#   * nlp-ui  : Streamlit frontend (RUN_MODE=ui), wired to the API via
+#               the API_BASE_URL env var.
+#
+# Deploy via "New + > Blueprint" in the Render dashboard, or
+# `render blueprint launch` from the Render CLI. See DEPLOYMENT.md for the
+# full walkthrough and free-tier caveats.
+
+services:
+  - type: web
+    name: nlp-api
+    runtime: docker
+    plan: starter   # 512 MB free tier OOMs on first FAISS load; bump to
+                    # standard if you need persistent semantic search.
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: RUN_MODE
+        value: api
+      - key: API_LOG_LEVEL
+        value: INFO
+      - key: API_CORS_ORIGINS
+        value: "*"
+      # Render injects $PORT automatically; the Dockerfile honours it.
+
+  - type: web
+    name: nlp-ui
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /_stcore/health
+    autoDeploy: true
+    envVars:
+      - key: RUN_MODE
+        value: ui
+      - key: API_BASE_URL
+        # Render exposes other services via service-discovery hostnames.
+        # Replace with your own service URL after the first blueprint launch.
+        fromService:
+          type: web
+          name: nlp-api
+          property: hostport

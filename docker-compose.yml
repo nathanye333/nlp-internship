@@ -16,11 +16,26 @@ services:
     ports:
       - "8000:8000"
     environment:
+      RUN_MODE: api
+      PORT: 8000
       API_LOG_LEVEL: INFO
     volumes:
       - ./data:/app/data:ro
     depends_on:
       - mysql
+    restart: unless-stopped
+
+  ui:
+    build: .
+    image: nlp-internship-api:latest
+    ports:
+      - "8501:8501"
+    environment:
+      RUN_MODE: ui
+      PORT: 8501
+      API_BASE_URL: http://api:8000
+    depends_on:
+      - api
     restart: unless-stopped
 
 volumes:

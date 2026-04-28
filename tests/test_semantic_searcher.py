@@ -74,6 +74,21 @@ def test_semantic_search_returns_expected_neighbors():
     assert searcher.embedding_dim == 384
 
 
+def test_semantic_search_supports_allowed_listing_ids():
+    remarks = [
+        "Beautiful home with swimming pool and patio",
+        "Condo with attached garage and storage",
+        "Waterfront property with ocean views",
+    ]
+    ids = ["A", "B", "C"]
+    searcher = SemanticSearcher(encoder=FakeEncoder())
+    searcher.build_index(remarks, listing_ids=ids)
+
+    results = searcher.search("house with pool", top_k=3, allowed_listing_ids={"B", "C"})
+    assert {r.listing_id for r in results} == {"B", "C"}
+    assert len(results) == 2
+
+
 def test_bm25_searcher_prefers_exact_keyword_match():
     remarks = [
         "Loft with skyline view",
@@ -86,6 +101,19 @@ def test_bm25_searcher_prefers_exact_keyword_match():
     results = bm25.search("workshop garage", top_k=2)
     assert results
     assert "workshop" in results[0].remark.lower()
+
+
+def test_bm25_search_supports_allowed_listing_ids():
+    remarks = [
+        "Loft with skyline view",
+        "Family house with garage",
+        "Garage plus workshop and parking",
+    ]
+    bm25 = BM25Searcher()
+    bm25.build_index(remarks, listing_ids=["A", "B", "C"])
+
+    results = bm25.search("workshop garage", top_k=3, allowed_listing_ids={"B"})
+    assert [r.listing_id for r in results] == ["B"]
 
 
 def test_comparison_table_and_relevance_pair_generation():

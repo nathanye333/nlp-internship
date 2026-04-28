@@ -54,6 +54,10 @@ def _assert_subset(actual: dict, expected_subset: dict):
         ("3+ bed", {"bedrooms_min": 3}),
         ("3 + br", {"bedrooms_min": 3}),
         ("at least 5 bedrooms", {"bedrooms_min": 5}),
+        ("over 2 bedrooms", {"bedrooms_min": 2}),
+        ("above 4 bed", {"bedrooms_min": 4}),
+        ("under 3 bedrooms", {"bedrooms_max": 3}),
+        ("below 5 br", {"bedrooms_max": 5}),
         ("3-4 bed", {"bedrooms_min": 3, "bedrooms_max": 4}),
         ("2 to 3 bedrooms", {"bedrooms_min": 2, "bedrooms_max": 3}),
         ("studio under 600k", {"bedrooms_max": 0, "price_max": 600000}),
@@ -61,12 +65,16 @@ def _assert_subset(actual: dict, expected_subset: dict):
         ("2 bath", {"bathrooms_min": 2.0, "bathrooms_max": 2.0}),
         ("2.5 baths", {"bathrooms_min": 2.5, "bathrooms_max": 2.5}),
         ("at least 2.5 bathroom", {"bathrooms_min": 2.5}),
+        ("over 2 bathrooms", {"bathrooms_min": 2.0}),
+        ("above 1.5 bath", {"bathrooms_min": 1.5}),
+        ("under 3 bathrooms", {"bathrooms_max": 3.0}),
+        ("below 2.5 ba", {"bathrooms_max": 2.5}),
         ("2-3 bath", {"bathrooms_min": 2.0, "bathrooms_max": 3.0}),
         ("2 to 2.5 bathrooms", {"bathrooms_min": 2.0, "bathrooms_max": 2.5}),
         # --- city patterns ---
         ("in San Diego under 900k", {"city": "San Diego", "price_max": 900000}),
         ("near los angeles 3 bed", {"city": "Los Angeles", "bedrooms_min": 3, "bedrooms_max": 3}),
-        ("around LA under 800k", {"city": "LA", "price_max": 800000}),
+        ("around LA under 800k", {"city": "Los Angeles", "price_max": 800000}),
         ("within Irvine 3 bed", {"city": "Irvine", "bedrooms_min": 3, "bedrooms_max": 3}),
         # --- amenities include ---
         ("with pool under 1m", {"price_max": 1000000, "amenities_in": ["pool"]}),
@@ -115,6 +123,22 @@ def _assert_subset(actual: dict, expected_subset: dict):
 def test_parse_expected_filters(parser, query, expected_subset):
     filters = parser.parse(query)
     _assert_subset(filters, expected_subset)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "3 bed under 900k in Southern California",
+        "pool near Orange County",
+        "condo around SoCal under 700k",
+        "home within California with garage",
+    ],
+)
+def test_invalid_region_names_are_not_city_filters(parser, query):
+    filters = parser.parse(query)
+    assert "city" not in filters
+    parsed = parser.parse_to_sql(query)
+    assert QueryParser.COL_CITY not in parsed.where_sql
 
 
 @pytest.mark.parametrize(
