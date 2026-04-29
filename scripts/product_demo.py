@@ -81,6 +81,28 @@ def format_beds_baths(
     return " · ".join(parts) if parts else "Beds/baths n/a"
 
 
+def format_sqft(sqft: Optional[float]) -> str:
+    if sqft is None:
+        return "Sqft n/a"
+    try:
+        return f"{int(sqft):,} sqft"
+    except (TypeError, ValueError):
+        return f"{sqft} sqft"
+
+
+def format_home_facts(
+    beds: Optional[float],
+    baths: Optional[float],
+    sqft: Optional[float],
+) -> str:
+    parts: list[str] = []
+    if beds is not None or baths is not None:
+        parts.append(format_beds_baths(beds, baths))
+    if sqft is not None:
+        parts.append(format_sqft(sqft))
+    return " · ".join(parts) if parts else "Beds/baths/sqft n/a"
+
+
 def filter_chips(filters: Mapping[str, Any]) -> list[str]:
     """Render parsed filter dict as a list of human-friendly chip strings."""
     chips: list[str] = []
@@ -94,6 +116,10 @@ def filter_chips(filters: Mapping[str, Any]) -> list[str]:
         chips.append(f"beds <= {bmax}")
     if (btmin := filters.get("bathrooms_min")) is not None:
         chips.append(f"baths >= {btmin}")
+    if (sqmin := filters.get("sqft_min")) is not None:
+        chips.append(f"sqft >= {int(sqmin):,}")
+    if (sqmax := filters.get("sqft_max")) is not None:
+        chips.append(f"sqft <= {int(sqmax):,}")
     if (pmin := filters.get("price_min")) is not None:
         chips.append(f"price >= ${int(pmin):,}")
     if (pmax := filters.get("price_max")) is not None:
@@ -133,6 +159,7 @@ def enrich_results(
                 "city": detail.get("city"),
                 "beds": detail.get("beds"),
                 "baths": detail.get("baths"),
+                "sqft": detail.get("sqft"),
                 "price": detail.get("price"),
                 "summary": detail.get("summary"),
                 "compliance_ok": detail.get("compliance_ok"),
@@ -323,7 +350,7 @@ def render_search_tab(st_module: Any, client: DemoApiClient) -> None:
             header_cols[1].markdown(
                 f"<div style='text-align:right'>"
                 f"<b>{format_price(row['price'])}</b><br/>"
-                f"<small>{format_beds_baths(row['beds'], row['baths'])}</small>"
+                f"<small>{format_home_facts(row['beds'], row['baths'], row.get('sqft'))}</small>"
                 f"</div>",
                 unsafe_allow_html=True,
             )
@@ -480,7 +507,7 @@ def render_compare_tab(st_module: Any, client: DemoApiClient) -> None:
                             st_module.caption(row["city"])
                         st_module.write(
                             f"{format_price(row['price'])} · "
-                            f"{format_beds_baths(row['beds'], row['baths'])}"
+                            f"{format_home_facts(row['beds'], row['baths'], row.get('sqft'))}"
                         )
                         st_module.caption(
                             f"id: `{row['listing_id']}` · score: {row['score']:.3f}"

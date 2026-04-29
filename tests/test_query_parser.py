@@ -71,6 +71,12 @@ def _assert_subset(actual: dict, expected_subset: dict):
         ("below 2.5 ba", {"bathrooms_max": 2.5}),
         ("2-3 bath", {"bathrooms_min": 2.0, "bathrooms_max": 3.0}),
         ("2 to 2.5 bathrooms", {"bathrooms_min": 2.0, "bathrooms_max": 2.5}),
+        # --- sqft patterns ---
+        ("under 2000 sqft in Irvine", {"sqft_max": 2000, "city": "Irvine"}),
+        ("over 1500 square feet with pool", {"sqft_min": 1500, "amenities_in": ["pool"]}),
+        ("1800 sq ft condo", {"sqft_min": 1800, "sqft_max": 1800}),
+        ("1500-2000 sqft", {"sqft_min": 1500, "sqft_max": 2000}),
+        ("1,600 to 2,100 sf", {"sqft_min": 1600, "sqft_max": 2100}),
         # --- city patterns ---
         ("in San Diego under 900k", {"city": "San Diego", "price_max": 900000}),
         ("near los angeles 3 bed", {"city": "Los Angeles", "bedrooms_min": 3, "bedrooms_max": 3}),

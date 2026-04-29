@@ -18,6 +18,7 @@ that repeated calls (across the API and tests) reuse the same in-memory dict.
 from __future__ import annotations
 
 import csv
+import re
 from pathlib import Path
 from threading import Lock
 from typing import Iterable, Optional
@@ -25,6 +26,10 @@ from typing import Iterable, Optional
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_CSV = _PROJECT_ROOT / "data" / "processed" / "listing_sample_cleaned.csv"
+_SQFT_RE = re.compile(
+    r"\b(\d[\d,]{2,6})\s*(?:sq\.?\s*ft|square\s*feet|sqft|sf)\b",
+    flags=re.I,
+)
 
 
 def _coerce_int(value: str | None) -> Optional[int]:
@@ -43,6 +48,24 @@ def _coerce_float(value: str | None) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _extract_sqft(*remarks: str | None) -> Optional[int]:
+    """Best-effort sqft extraction from listing remarks text."""
+    for text in remarks:
+        if not text:
+            continue
+        m = _SQFT_RE.search(text)
+        if not m:
+            continue
+        digits = re.sub(r"[^\d]", "", m.group(1))
+        if not digits:
+            continue
+        try:
+            return int(digits)
+        except ValueError:
+            continue
+    return None
 
 
 class ListingMetadataStore:
@@ -78,6 +101,11 @@ class ListingMetadataStore:
                         "beds": _coerce_float(row.get("beds")),
                         "baths": _coerce_float(row.get("baths")),
                         "price": _coerce_int(row.get("price")),
+                        "sqft": _coerce_int(row.get("sqft"))
+                        or _extract_sqft(
+                            (row.get("remarks_clean") or "").strip() or None,
+                            (row.get("remarks") or "").strip() or None,
+                        ),
                         "remarks": (row.get("remarks") or "").strip() or None,
                         "remarks_clean": (row.get("remarks_clean") or "").strip()
                         or None,

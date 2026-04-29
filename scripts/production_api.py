@@ -449,6 +449,7 @@ class ListingDetail(BaseModel):
     beds: Optional[float] = None
     baths: Optional[float] = None
     price: Optional[int] = None
+    sqft: Optional[int] = None
     remarks: Optional[str] = None
     summary: Optional[str] = None
     compliance_ok: Optional[bool] = None
@@ -792,6 +793,8 @@ def _metadata_filters_present(filters: dict) -> bool:
     keys = {
         "price_min",
         "price_max",
+        "sqft_min",
+        "sqft_max",
         "bedrooms_min",
         "bedrooms_max",
         "bathrooms_min",
@@ -856,6 +859,12 @@ def listing_matches_metadata_filters(record: dict | None, filters: dict) -> bool
         record.get("baths"),
         minimum=filters.get("bathrooms_min"),
         maximum=filters.get("bathrooms_max"),
+    ):
+        return False
+    if not _matches_range(
+        record.get("sqft"),
+        minimum=filters.get("sqft_min"),
+        maximum=filters.get("sqft_max"),
     ):
         return False
 
@@ -1503,6 +1512,7 @@ async def get_listing_detail(
         beds=record.get("beds"),
         baths=record.get("baths"),
         price=record.get("price"),
+        sqft=record.get("sqft"),
         remarks=record.get("remarks"),
         summary=summary,
         compliance_ok=compliance_ok,

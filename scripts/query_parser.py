@@ -61,6 +61,7 @@ class QueryParser:
     COL_CITY = "L_City"
     COL_BEDS = "L_Keyword2"
     COL_BATHS = "LM_Dec_3"
+    COL_SQFT = "sqft"
     COL_REMARKS = "L_Remarks"
 
     # Common amenity keywords -> (SQL snippet, param builder)
@@ -88,6 +89,7 @@ class QueryParser:
         - price_min, price_max
         - bedrooms_min, bedrooms_max
         - bathrooms_min, bathrooms_max
+        - sqft_min, sqft_max
         - city
         - amenities_in (list[str]), amenities_out (list[str])
         """
@@ -100,6 +102,7 @@ class QueryParser:
         self._parse_price(q, filters)
         self._parse_beds(q, filters)
         self._parse_baths(q, filters)
+        self._parse_sqft(q, filters)
         self._parse_city(q, filters)
         self._parse_amenities(q, filters)
 
@@ -157,6 +160,12 @@ class QueryParser:
         if "bathrooms_max" in filters:
             conditions.append(f"{self.COL_BATHS} <= %s")
             params.append(float(filters["bathrooms_max"]))
+        if "sqft_min" in filters:
+            conditions.append(f"{self.COL_SQFT} >= %s")
+            params.append(int(filters["sqft_min"]))
+        if "sqft_max" in filters:
+            conditions.append(f"{self.COL_SQFT} <= %s")
+            params.append(int(filters["sqft_max"]))
 
         # City
         if "city" in filters:
@@ -349,6 +358,50 @@ class QueryParser:
         city = self._normalize_city(raw)
         if city:
             filters["city"] = city
+
+    def _parse_sqft(self, q: str, filters: dict) -> None:
+        # "1500-2000 sqft", "1500 to 2000 square feet"
+        m = re.search(
+            r"\b(\d[\d,]*)\s*(?:-|to|–)\s*(\d[\d,]*)\s*(?:sq\.?\s*ft|square\s*feet|sqft|sf)\b",
+            q,
+            flags=re.I,
+        )
+        if m:
+            lo = int(re.sub(r"[^\d]", "", m.group(1)))
+            hi = int(re.sub(r"[^\d]", "", m.group(2)))
+            self._set_min_max(filters, "sqft_min", "sqft_max", min(lo, hi), max(lo, hi))
+            return
+
+        # "under 2000 sqft"
+        m = re.search(
+            r"(?:under|below|less than|<|at most|no more than)\s*(\d[\d,]*)\s*(?:sq\.?\s*ft|square\s*feet|sqft|sf)\b",
+            q,
+            flags=re.I,
+        )
+        if m:
+            filters["sqft_max"] = int(re.sub(r"[^\d]", "", m.group(1)))
+            return
+
+        # "over 1500 sqft"
+        m = re.search(
+            r"(?:over|above|more than|>|at least|min(?:imum)?)\s*(\d[\d,]*)\s*(?:sq\.?\s*ft|square\s*feet|sqft|sf)\b",
+            q,
+            flags=re.I,
+        )
+        if m:
+            filters["sqft_min"] = int(re.sub(r"[^\d]", "", m.group(1)))
+            return
+
+        # exact "1800 sqft"
+        m = re.search(
+            r"\b(\d[\d,]*)\s*(?:sq\.?\s*ft|square\s*feet|sqft|sf)\b",
+            q,
+            flags=re.I,
+        )
+        if m:
+            n = int(re.sub(r"[^\d]", "", m.group(1)))
+            filters["sqft_min"] = n
+            filters["sqft_max"] = n
 
     def _normalize_city(self, raw: str) -> str | None:
         # Reject strings with obvious SQL / control characters

@@ -37,6 +37,7 @@ from scripts.product_demo import (  # noqa: E402
     enrich_results,
     filter_chips,
     format_beds_baths,
+    format_home_facts,
     format_price,
     overlap_summary,
     render_compliance_flag,
@@ -96,11 +97,13 @@ class _StubBM25:
 def stub_metadata_store(tmp_path) -> ListingMetadataStore:  # noqa: ANN001
     csv_path = tmp_path / "listings.csv"
     csv_path.write_text(
-        "L_ListingID,L_Address,L_City,beds,baths,price,remarks,remarks_clean\n"
+        "L_ListingID,L_Address,L_City,beds,baths,price,sqft,remarks,remarks_clean\n"
         "L-1,42 Pine St,Irvine,3,2,725000,"
+        "1850,"
         "\"3 bed pool home in Irvine.\","
         "\"3 bed pool home in Irvine.\"\n"
         "L-2,99 Oak Ave,Austin,2,1,499000,"
+        "960,"
         "\"Downtown condo with hardwood.\","
         "\"Downtown condo with hardwood.\"\n",
         encoding="utf-8",
@@ -264,10 +267,16 @@ def test_format_beds_baths() -> None:
     assert format_beds_baths(None, None) == "Beds/baths n/a"
 
 
+def test_format_home_facts() -> None:
+    assert format_home_facts(3, 2, 1850) == "3 beds · 2 baths · 1,850 sqft"
+    assert format_home_facts(None, None, None) == "Beds/baths/sqft n/a"
+
+
 def test_filter_chips_renders_each_filter() -> None:
     filters = {
         "city": "Irvine",
         "bedrooms_min": 3,
+        "sqft_min": 1500,
         "price_max": 700_000,
         "amenities_in": ["pool"],
         "amenities_out": ["hoa"],
@@ -275,6 +284,7 @@ def test_filter_chips_renders_each_filter() -> None:
     chips = filter_chips(filters)
     assert "city = Irvine" in chips
     assert "beds >= 3" in chips
+    assert "sqft >= 1,500" in chips
     assert "price <= $700,000" in chips
     assert "+pool" in chips
     assert "-hoa" in chips
@@ -295,6 +305,7 @@ def test_enrich_results_joins_hits_with_metadata() -> None:
             "city": "Irvine",
             "beds": 3,
             "baths": 2,
+            "sqft": 1850,
             "price": 725000,
             "summary": "great place",
             "compliance_ok": False,
@@ -306,6 +317,7 @@ def test_enrich_results_joins_hits_with_metadata() -> None:
     rows = enrich_results(hits, details)
     assert rows[0]["address"] == "42 Pine St"
     assert rows[0]["price"] == 725000
+    assert rows[0]["sqft"] == 1850
     assert rows[0]["compliance_ok"] is False
     assert rows[0]["compliance_error_count"] == 1
     assert rows[0]["found"] is True

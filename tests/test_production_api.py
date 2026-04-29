@@ -132,14 +132,17 @@ class _StubBM25Searcher:
 def stub_metadata_store(tmp_path) -> ListingMetadataStore:  # noqa: ANN001
     csv_path = tmp_path / "listings.csv"
     csv_path.write_text(
-        "L_ListingID,L_Address,L_City,beds,baths,price,remarks,remarks_clean\n"
+        "L_ListingID,L_Address,L_City,beds,baths,price,sqft,remarks,remarks_clean\n"
         "L-1,42 Pine St,Irvine,3,2,725000,"
+        "1850,"
         "\"Charming 3 bed home with pool and garage in Irvine.\","
         "\"Charming 3 bed home with pool and garage in Irvine.\"\n"
         "L-2,99 Oak Ave,Austin,2,1,499000,"
+        "960,"
         "\"Cozy 2 bed condo near downtown.\","
         "\"Cozy 2 bed condo near downtown.\"\n"
         "L-3,7 Elm Ct,Los Angeles,4,3,1200000,"
+        "2700,"
         "\"Spacious 4 bed estate with pool.\","
         "\"Spacious 4 bed estate with pool.\"\n",
         encoding="utf-8",
@@ -569,6 +572,7 @@ def test_listing_matches_metadata_filters() -> None:
         "beds": 3,
         "baths": 2,
         "price": 725_000,
+        "sqft": 1850,
     }
     assert listing_matches_metadata_filters(
         record,
@@ -582,6 +586,7 @@ def test_listing_matches_metadata_filters() -> None:
     )
     assert not listing_matches_metadata_filters(record, {"city": "Austin"})
     assert not listing_matches_metadata_filters(record, {"price_max": 700_000})
+    assert not listing_matches_metadata_filters(record, {"sqft_min": 2000})
     assert not listing_matches_metadata_filters(None, {"city": "Irvine"})
 
 
@@ -609,6 +614,7 @@ def test_candidate_listing_ids_applies_full_sql_like_filters(
             "city": "Irvine",
             "price_max": 800_000,
             "bedrooms_min": 3,
+            "sqft_min": 1500,
             "amenities_in": ["pool"],
             "amenities_out": ["hoa"],
         },
@@ -720,6 +726,7 @@ def test_listing_detail_enriches_hit(client: TestClient) -> None:
     assert body["beds"] == 3
     assert body["baths"] == 2
     assert body["price"] == 725000
+    assert body["sqft"] == 1850
     assert body["summary"] is not None and len(body["summary"]) > 0
     assert body["compliance_ok"] is True
     assert body["compliance_error_count"] == 0
